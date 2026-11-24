@@ -2581,6 +2581,40 @@ fn gpu_format_stores_atomics_global_lds() {
     assert_eq!(got, (0..64).collect::<Vec<u32>>(), "ds_add_rtn_u32 returns every old value once (from {base:#x}): {olds:?}");
 }
 
+/// Contending subword stores leave one complete writer's value and preserve neighboring bytes.
+#[test]
+fn gpu_lds_contended_subword_stores_do_not_mix_writers() {
+    if !gpu_ready() {
+        return;
+    }
+    let initial = 0xA5C3_5A7E;
+    let mut state = KernelState::default();
+    for (lane, registers) in state.vgpr.iter_mut().enumerate() {
+        let value = if lane % 2 == 0 { 0x1111 } else { 0x2222 };
+        registers[1] = initial;
+        registers[2] = value | (value << 16);
+    }
+    for (instruction, offset, expected) in [
+        ("DS_WRITE_B8", 1, [0xA5C3_117E, 0xA5C3_227E]),
+        ("DS_WRITE_B16", 2, [0x1111_5A7E, 0x2222_5A7E]),
+        ("DS_WRITE_B8_D16_HI", 1, [0xA5C3_117E, 0xA5C3_227E]),
+        ("DS_WRITE_B16_D16_HI", 2, [0x1111_5A7E, 0x2222_5A7E]),
+    ] {
+        let program = prog(&[
+            ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 0), ("DATA0", 1)], None),
+            ("S_BARRIER", "ENC_SOPP", &[], None),
+            (instruction, "ENC_DS", &[("ADDR", 0), ("DATA0", 2), ("OFFSET0", offset)], None),
+            ("S_BARRIER", "ENC_SOPP", &[], None),
+            ("DS_READ_B32", "ENC_DS", &[("ADDR", 0), ("VDST", 3)], None),
+        ]);
+        let result = runner::run_code(&program, &state, &[]).unwrap();
+        for (lane, registers) in result.vgpr.iter().enumerate() {
+            let word = registers[3];
+            assert!(expected.contains(&word), "{instruction}, lane {lane}: mixed or damaged word {word:#010x}");
+        }
+    }
+}
+
 /// global_*_dword_addtid (ENC_FLAT_GLBL): the spec gives them no ADDR operand – the
 /// address is the scalar SADDR pair ("off"/null encodes a zero base) plus 4 times the
 /// lane index plus the signed 12-bit OFFSET. Emitted HLSL is deterministic.

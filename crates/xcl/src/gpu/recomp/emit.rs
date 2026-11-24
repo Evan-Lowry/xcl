@@ -4055,6 +4055,16 @@ impl Em {
                 _ => return None,
             })
         };
+        // Replace the subword in one read-modify-write. Separate AND and OR
+        // atomics can combine bits from different lanes writing the same byte.
+        let store_part = |slot: String, v: &str, mask: u64, shift: &str| {
+            let clear = format!("({mask}u << {shift})");
+            let set = format!("(({v} & {mask}u) << {shift})");
+            let old = format!("{t}_old");
+            let body = rmw32("mskor_b32", &At::Ref(slot), &clear, &set, &old, &t)
+                .expect("masked LDS operation is supported");
+            format!("if ({act}) {{ uint {old} = 0u; {body} }}")
+        };
         // d16 8 / 16-bit LDS accesses (half of the VGPR)
         if let Some((bits, signed, write, half)) = ds_d16(name) {
             let at = format!("{a} + {off16}u");
@@ -4063,7 +4073,7 @@ impl Em {
             let mask = (1u64 << bits) - 1;
             if write {
                 let v = d16_data(&self.vreg(f("DATA0")), half);
-                self.line(&format!("if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"));
+                self.line(&store_part(slot, &v, mask, &sh));
             } else {
                 let v = self.vreg(f("VDST"));
                 let raw = format!("({slot} >> {sh})");
@@ -4071,7 +4081,7 @@ impl Em {
             }
             return Ok(());
         }
-        // 8 / 16-bit LDS accesses: atomic and / or keep the rest of the dword intact
+        // 8 / 16-bit LDS accesses
         let small = match name {
             "ds_write_b8" => Some((8u32, false, true)),
             "ds_write_b16" => Some((16, false, true)),
@@ -4088,9 +4098,7 @@ impl Em {
             let mask = (1u64 << bits) - 1;
             if write {
                 let v = self.vreg(f("DATA0"));
-                self.line(&format!(
-                    "if ({act}) {{ InterlockedAnd({slot}, ~({mask}u << {sh})); InterlockedOr({slot}, ({v} & {mask}u) << {sh}); }}"
-                ));
+                self.line(&store_part(slot, &v, mask, &sh));
             } else {
                 let v = self.vreg(f("VDST"));
                 let val = if signed {
